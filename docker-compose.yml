@@ -1,0 +1,7 @@
+services:
+  apoloia:
+    build: .
+    container_name: apoloia
+    ports:
+      - "3000:80"
+    restart: unless-stopped

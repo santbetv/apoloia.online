@@ -1,0 +1,289 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EC2 Ubuntu - Deploy app Apoloia con Docker + Nginx + SSL (apoloia.online)
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t2.small
+
+  LatestUbuntuAmiId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-015ae009235dd821e
+    Description: AMI de Ubuntu 22.04 para us-east-2
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+
+  DomainName:
+    Type: String
+    Default: "apoloia.online"
+    Description: Dominio principal. Debe apuntar a la IP de esta instancia antes de deployar
+
+  GitRepoUrl:
+    Type: String
+    Default: "https://github.com/TU_USUARIO/apoloia.git"
+    Description: URL del repositorio Git con el codigo de la app
+
+Resources:
+  # =========================
+  # VPC
+  # =========================
+  MainVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MainVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: us-east-2a
+      MapPublicIpOnLaunch: true
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MainVPC
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIGW
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  # =========================
+  # Security Group
+  # =========================
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite HTTP, HTTPS y SSH
+      VpcId: !Ref MainVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # =========================
+  # IAM para SSM
+  # =========================
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # =========================
+  # EC2
+  # =========================
+  WebInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestUbuntuAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref WebSG
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: apoloia-ec2
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            set -e
+
+            DOMAIN="${DomainName}"
+            GIT_REPO="${GitRepoUrl}"
+
+            # ---- Sistema base ----
+            apt-get update -y
+            apt-get install -y git curl ca-certificates gnupg lsb-release
+
+            # ---- Docker ----
+            mkdir -p /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+              $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+            apt-get update -y
+            apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+            systemctl enable docker
+            systemctl start docker
+            usermod -aG docker ubuntu
+
+            # ---- Clonar y build ----
+            git clone "$GIT_REPO" /opt/apoloia
+            cd /opt/apoloia
+            docker build -t apoloia:latest .
+
+            # ---- Correr contenedor (puerto interno 8080 -> container 80) ----
+            docker run -d \
+              --name apoloia \
+              --restart unless-stopped \
+              -p 8080:80 \
+              apoloia:latest
+
+            # ---- Nginx como reverse proxy + SSL ----
+            apt-get install -y nginx certbot python3-certbot-nginx
+
+            cat > /etc/nginx/sites-available/apoloia <<EOF
+            server {
+                listen 80;
+                server_name $DOMAIN www.$DOMAIN;
+
+                location / {
+                    proxy_pass http://127.0.0.1:8080;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto \$scheme;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                }
+            }
+            EOF
+
+            ln -s /etc/nginx/sites-available/apoloia /etc/nginx/sites-enabled/apoloia
+            rm -f /etc/nginx/sites-enabled/default
+            nginx -t
+            systemctl enable nginx
+            systemctl start nginx
+
+            # ---- SSL con Let's Encrypt ----
+            echo "Esperando 30s para que nginx arranque..."
+            sleep 30
+
+            certbot --nginx \
+              -d "$DOMAIN" \
+              -d "www.$DOMAIN" \
+              --non-interactive \
+              --agree-tos \
+              --email "admin@$DOMAIN" \
+              --redirect
+
+            systemctl enable certbot.timer
+            systemctl start certbot.timer
+
+            echo "Deploy completo: https://$DOMAIN"
+
+  # =========================
+  # Scheduler start/stop (ahorro de costos)
+  # =========================
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ec2-control
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${WebInstance}
+
+  StartSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      ScheduleExpression: cron(0 8 * * ? *)
+      ScheduleExpressionTimezone: America/Bogota
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ec2:startInstances
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub |
+          {"InstanceIds":["${WebInstance}"]}
+
+  StopSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      ScheduleExpression: cron(50 23 * * ? *)
+      ScheduleExpressionTimezone: America/Bogota
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ec2:stopInstances
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub |
+          {"InstanceIds":["${WebInstance}"]}
+
+Outputs:
+  PublicIP:
+    Value: !GetAtt WebInstance.PublicIp
+    Description: IP publica - apunta tu dominio A record a esta IP
+
+  AppURL:
+    Value: !Sub https://${DomainName}
+    Description: URL de la app Apoloia
+
+  SSHCommand:
+    Value: !Sub ssh ubuntu@${WebInstance.PublicIp}
+    Description: Conexion SSH

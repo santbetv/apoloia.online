@@ -1,0 +1,435 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EC2 Ubuntu en VPC publica sin ALB (bajo costo)
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t2.small
+
+  LatestUbuntuAmiId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-015ae009235dd821e
+    Description: AMI de Ubuntu 22.04 para us-east-2
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+
+  DomainName:
+    Type: String
+    Default: "salesfordaity.daity.app"
+    Description: Dominio para certificado SSL. Debe apuntar a la IP de esta instancia
+
+  N8nSubdomain:
+    Type: String
+    Default: "n8n.daity.app"
+    Description: Subdominio para n8n con SSL. Debe apuntar a la IP de esta instancia
+
+Resources:
+  # =========================
+  # VPC
+  # =========================
+  MainVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MainVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: us-east-2a
+      MapPublicIpOnLaunch: true
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MainVPC
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIGW
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  # =========================
+  # Security Group
+  # =========================
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite HTTP, HTTPS y SSH
+      VpcId: !Ref MainVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # =========================
+  # IAM para SSM
+  # =========================
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # =========================
+  # EC2
+  # =========================
+  WebInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestUbuntuAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref WebSG
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: santi-ec2-ia-n8n
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            set -e
+
+            DOMAIN="${DomainName}"
+            N8N_SUBDOMAIN="${N8nSubdomain}"
+
+            # Actualizar sistema
+            apt-get update -y
+            apt-get install -y nginx curl git
+            systemctl enable nginx
+            systemctl start nginx
+
+            # Instalar Node.js 20.x LTS (compatible con n8n)
+            curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+            apt-get install -y nodejs
+
+            # Verificar instalación
+            node --version
+            npm --version
+
+            # Instalar n8n globalmente
+            npm install -g n8n
+
+            # Crear usuario para n8n
+            useradd -m -s /bin/bash n8n
+
+            # Crear directorio de datos
+            mkdir -p /home/n8n/.n8n
+            chown -R n8n:n8n /home/n8n/.n8n
+
+            # Crear servicio systemd para n8n
+            cat > /etc/systemd/system/n8n.service <<EOF
+            [Unit]
+            Description=n8n workflow automation
+            After=network.target
+
+            [Service]
+            Type=simple
+            User=n8n
+            ExecStart=/usr/bin/n8n start
+            Restart=on-failure
+            Environment="N8N_HOST=$N8N_SUBDOMAIN"
+            Environment="N8N_PORT=5678"
+            Environment="N8N_PROTOCOL=https"
+            Environment="WEBHOOK_URL=https://$N8N_SUBDOMAIN/"
+            WorkingDirectory=/home/n8n
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            # NO iniciar n8n todavía, primero configuramos Nginx
+            systemctl daemon-reload
+            systemctl enable n8n
+
+            # Instalar Docker
+            apt-get install -y ca-certificates gnupg lsb-release
+
+            # Agregar la clave GPG oficial de Docker
+            mkdir -p /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+            # Configurar repositorio de Docker
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+              $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+            # Instalar Docker Engine, CLI y Docker Compose
+            apt-get update -y
+            apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+            # Habilitar e iniciar Docker
+            systemctl enable docker
+            systemctl start docker
+
+            # Agregar usuario ubuntu al grupo docker
+            usermod -aG docker ubuntu
+
+            # Verificar instalación
+            docker --version
+            docker compose version
+
+            # Configurar Nginx como reverse proxy para n8n
+            cat > /etc/nginx/sites-available/n8n <<EOF
+            server {
+                listen 80;
+                server_name $N8N_SUBDOMAIN;
+
+                client_header_buffer_size 16k;
+                large_client_header_buffers 8 32k;
+                proxy_buffer_size 16k;
+                proxy_buffers 8 16k;
+                proxy_busy_buffers_size 32k;
+
+                location / {
+                    proxy_pass http://127.0.0.1:5678;
+                    proxy_http_version 1.1;
+                    proxy_set_header Upgrade \$http_upgrade;
+                    proxy_set_header Connection "upgrade";
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto \$scheme;
+                    proxy_set_header X-Real-IP \$remote_addr;
+
+                    # Timeouts para n8n
+                    proxy_read_timeout 300;
+                    proxy_connect_timeout 300;
+                    proxy_send_timeout 300;
+                }
+            }
+            EOF
+
+            # Habilitar sitio n8n
+            ln -s /etc/nginx/sites-available/n8n /etc/nginx/sites-enabled/n8n
+
+            # Probar configuración de Nginx
+            nginx -t
+
+            # Recargar Nginx
+            systemctl reload nginx
+
+            # Instalar Certbot para Let's Encrypt
+            apt-get install -y certbot python3-certbot-nginx
+
+            # Crear script de configuración SSL
+            cat > /usr/local/bin/setup-ssl.sh <<'SSLEOF'
+            #!/bin/bash
+            if [ -z "$1" ]; then
+              echo "Uso: setup-ssl.sh <dominio>"
+              exit 1
+            fi
+
+            DOMAIN="$1"
+            EMAIL="admin@$DOMAIN"
+
+            echo "Configurando SSL para $DOMAIN..."
+
+            PARTS=$(echo "$DOMAIN" | tr '.' '\n' | wc -l)
+
+            if [ "$PARTS" -gt 2 ]; then
+              certbot --nginx -d "$DOMAIN" \
+                --non-interactive \
+                --agree-tos \
+                --email "$EMAIL" \
+                --redirect
+            else
+              certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" \
+                --non-interactive \
+                --agree-tos \
+                --email "$EMAIL" \
+                --redirect
+            fi
+
+            systemctl enable certbot.timer
+            systemctl start certbot.timer
+
+            echo "SSL configurado exitosamente para $DOMAIN"
+            SSLEOF
+
+            chmod +x /usr/local/bin/setup-ssl.sh
+
+            # Crear script info en el home de ubuntu
+            cat > /home/ubuntu/ssl-setup-info.txt <<'INFOEOF'
+            =================================================================
+            CONFIGURACIÓN SSL/TLS CON LET'S ENCRYPT
+            =================================================================
+
+            Para configurar HTTPS con Let's Encrypt:
+
+            1. Asegúrate de que tu dominio apunte a esta IP pública
+            2. Ejecuta el siguiente comando:
+
+               sudo /usr/local/bin/setup-ssl.sh tu-dominio.com
+
+            Ejemplo:
+               sudo /usr/local/bin/setup-ssl.sh ejemplo.com
+
+            Esto configurará automáticamente:
+            - Certificado SSL de Let's Encrypt
+            - Renovación automática cada 90 días
+            - Redirección de HTTP a HTTPS en Nginx
+
+            =================================================================
+            INFOEOF
+
+            chown ubuntu:ubuntu /home/ubuntu/ssl-setup-info.txt
+
+            # Configurar SSL automáticamente si se proporcionó un dominio
+            echo "Esperando 30 segundos para que Nginx esté completamente iniciado..."
+            sleep 30
+
+            if [ -n "$DOMAIN" ]; then
+              echo "Configurando SSL para dominio principal: $DOMAIN"
+              /usr/local/bin/setup-ssl.sh "$DOMAIN"
+              echo "SSL configurado para $DOMAIN"
+            fi
+
+            if [ -n "$N8N_SUBDOMAIN" ]; then
+              echo "Configurando SSL para n8n: $N8N_SUBDOMAIN"
+              /usr/local/bin/setup-ssl.sh "$N8N_SUBDOMAIN"
+              echo "SSL configurado para $N8N_SUBDOMAIN"
+
+              # Ahora sí iniciar n8n después de que SSL esté configurado
+              systemctl start n8n
+              echo "n8n iniciado en https://$N8N_SUBDOMAIN"
+            else
+              echo "No se proporcionó subdominio para n8n."
+              echo "Para configurar SSL para n8n más tarde, ejecuta:"
+              echo "sudo /usr/local/bin/setup-ssl.sh n8n.tudominio.com"
+
+              # Iniciar n8n de todos modos
+              systemctl start n8n
+            fi
+
+            echo "Instalación completa!"
+            echo "Dominio principal: https://$DOMAIN"
+            echo "n8n: https://$N8N_SUBDOMAIN"
+
+  # =========================
+  # Scheduler (start/stop)
+  # =========================
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ec2-control
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${WebInstance}
+
+  StartSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      ScheduleExpression: cron(0 8 * * ? *)
+      ScheduleExpressionTimezone: America/Bogota
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ec2:startInstances
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub |
+          {"InstanceIds":["${WebInstance}"]}
+
+  StopSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      ScheduleExpression: cron(50 23 * * ? *)
+      ScheduleExpressionTimezone: America/Bogota
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ec2:stopInstances
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub |
+          {"InstanceIds":["${WebInstance}"]}
+
+Outputs:
+  PublicIP:
+    Value: !GetAtt WebInstance.PublicIp
+    Description: IP publica de la instancia EC2
+
+  DomainURL:
+    Value: !Sub https://${DomainName}
+    Description: URL del dominio principal con HTTPS
+
+  N8nURL:
+    Value: !Sub https://${N8nSubdomain}
+    Description: URL de n8n con HTTPS via reverse proxy
+
+  SSHCommand:
+    Value: !Sub ssh ubuntu@${WebInstance.PublicIp}
+    Description: Comando para conectarse via SSH
