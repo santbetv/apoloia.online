@@ -26,7 +26,7 @@ Parameters:
 
   GitRepoUrl:
     Type: String
-    Default: "https://github.com/TU_USUARIO/apoloia.git"
+    Default: "https://github.com/santbetv/apoloia.online.git"
     Description: URL del repositorio Git con el codigo de la app
 
 Resources:
@@ -189,7 +189,7 @@ Resources:
             cat > /etc/nginx/sites-available/apoloia <<EOF
             server {
                 listen 80;
-                server_name $DOMAIN www.$DOMAIN;
+                server_name $DOMAIN;
 
                 location / {
                     proxy_pass http://127.0.0.1:8080;
@@ -214,7 +214,6 @@ Resources:
 
             certbot --nginx \
               -d "$DOMAIN" \
-              -d "www.$DOMAIN" \
               --non-interactive \
               --agree-tos \
               --email "admin@$DOMAIN" \
